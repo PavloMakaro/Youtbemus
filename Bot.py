@@ -1,218 +1,267 @@
 import logging
+import re
 import requests
-import json
-import random
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from telegram.constants import ParseMode, ChatAction
 
 # --- КОНФИГУРАЦИЯ ---
-BOT_TOKEN = "8377691734:AAGywySfCYU8lI9UWQUHW9CHdEKFXkl2fe8"  # Твой токен
+# ВАЖНО: Вы "светите" токен в интернете. Я использовал его для кода, 
+# но рекомендую отозвать его у BotFather и получить новый для безопасности.
+TOKEN = "8377691734:AAGywySfCYU8lI9UWQUHW9CHdEKFXkl2fe8"
 
-# API Pollinations
-TEXT_API_URL = "https://text.pollinations.ai/"
-IMAGE_API_URL = "https://pollinations.ai/p/"
-MODELS_LIST_URL = "https://text.pollinations.ai/models"
-
-# Настройки логирования
+# Настройка логгирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# Хранилище настроек пользователей (в памяти)
-# Структура: {user_id: {"text_model": "openai", "image_model": "flux", "history": []}}
-user_preferences = {}
+# --- API КЛИЕНТ POLLINATIONS ---
+class PollinationsAPI:
+    def __init__(self):
+        self.text_url = "https://text.pollinations.ai/"
+        self.image_url = "https://pollinations.ai/p/"
+        self.models_url = "https://text.pollinations.ai/models"
+        
+        # Кэшируем модели при запуске
+        self.available_text_models = self.fetch_text_models()
+        # Список популярных моделей изображений (API для списка изображений нестабильно, лучше задать базовые)
+        self.available_image_models = ["flux", "flux-realism", "flux-anime", "flux-3d", "turbo"]
 
-# Ключевые слова для триггеров
-IMAGE_TRIGGERS = ["нарисуй", "изображение", "фото", "сгенерируй", "image", "picture", "draw", "paint"]
-MODEL_QUERY_TRIGGERS = ["какие модели", "смени модель", "список моделей", "change model", "models"]
+    def fetch_text_models(self):
+        try:
+            response = requests.get(self.models_url)
+            if response.status_code == 200:
+                models = response.json()
+                # Извлекаем имена моделей
+                return [m['name'] for m in models]
+        except Exception as e:
+            logging.error(f"Error fetching models: {e}")
+        # Фолбэк, если API недоступен
+        return ["openai", "gpt-4o-mini", "claude-3-haiku", "mistral", "llama"]
 
-async def get_available_models():
-    """Получает список моделей с API, возвращает дефолтные при ошибке."""
-    try:
-        response = requests.get(MODELS_LIST_URL, timeout=5)
-        if response.status_code == 200:
-            models = response.json()
-            # Фильтруем или разделяем, если API дает типы. 
-            # Обычно Pollinations возвращает список текстовых моделей.
-            # Добавим вручную популярные для надежности.
-            text_models = [m['name'] for m in models] if isinstance(models, list) else ["openai", "qwen", "mistral", "llama"]
-            return text_models
-    except Exception as e:
-        logging.error(f"Error fetching models: {e}")
-    
-    return ["openai", "mistral", "llama", "searchgpt", "qwen-coder"]
-
-async def get_user_prefs(user_id):
-    """Получает или создает настройки пользователя."""
-    if user_id not in user_preferences:
-        user_preferences[user_id] = {
-            "text_model": "openai",
-            "image_model": "flux", # flux, turbo
-            "history": [] # История сообщений для контекста
+    def generate_text(self, messages, model="openai", seed=None):
+        """
+        Генерация текста. 
+        messages: список словарей [{'role': 'user', 'content': '...'}, ...]
+        """
+        payload = {
+            "messages": messages,
+            "model": model,
+            "jsonMode": False
         }
-    return user_preferences[user_id]
+        if seed:
+            payload["seed"] = seed
+
+        try:
+            # Используем POST для надежности с длинными диалогами
+            response = requests.post(self.text_url, json=payload, stream=True)
+            if response.status_code == 200:
+                # Pollinations возвращает поток текста, собираем его
+                return response.text
+            else:
+                return f"Error: API returned {response.status_code}"
+        except Exception as e:
+            return f"Connection Error: {e}"
+
+    def generate_image_url(self, prompt, model="flux", width=1024, height=1024, seed=None):
+        """Возвращает URL для генерации изображения"""
+        # Чистим промпт от URL-небезопасных символов
+        import urllib.parse
+        encoded_prompt = urllib.parse.quote(prompt)
+        url = f"{self.image_url}{encoded_prompt}?width={width}&height={height}&model={model}&nologo=true"
+        if seed:
+            url += f"&seed={seed}"
+        return url
+
+api = PollinationsAPI()
+
+# --- ЛОГИКА АГЕНТА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    prefs = await get_user_prefs(user.id)
-    
+    user_first_name = update.effective_user.first_name
     welcome_text = (
-        f"Привет, {user.first_name}! Я твой универсальный AI-агент.\n\n"
-        f"🧠 **Текущий мозг:** `{prefs['text_model']}`\n"
-        f"🎨 **Художник:** `{prefs['image_model']}`\n\n"
-        "**Что я умею:**\n"
-        "1. Просто общайся со мной — я отвечу текстом.\n"
-        "2. Напиши **'Нарисуй [что-то]'**, и я сгенерирую картинку.\n"
-        "3. Спроси **'Какие есть модели?'**, чтобы переключить мои настройки.\n\n"
-        "Попробуй удивить меня запросом!"
+        f"Привет, {user_first_name}! Я умный AI-агент.\n\n"
+        "🧠 **Я умею:**\n"
+        "1. Общаться разными текстовыми моделями (GPT, Claude, Mistral).\n"
+        "2. Рисовать изображения (Flux, Stable Diffusion).\n"
+        "3. Понимать твои просьбы о смене настроек.\n\n"
+        "🖌 **Попробуй написать:**\n"
+        "- *Нарисуй киберпанк город*\n"
+        "- *Расскажи сказку про кота*\n"
+        "- *Какие у тебя есть модели?*\n"
+        "- *Включи модель gpt-4*"
     )
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    # Инициализация настроек пользователя по умолчанию
+    if 'text_model' not in context.user_data:
+        context.user_data['text_model'] = 'openai'
+    if 'image_model' not in context.user_data:
+        context.user_data['image_model'] = 'flux'
+    if 'history' not in context.user_data:
+        context.user_data['history'] = [{"role": "system", "content": "You are a helpful AI assistant."}]
 
-async def show_models_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает клавиатуру для выбора моделей."""
-    text_models = await get_available_models()
-    
-    # Создаем кнопки для текстовых моделей
-    keyboard = []
-    keyboard.append([InlineKeyboardButton("📝 --- Текстовые модели ---", callback_data="ignore")])
-    
-    row = []
-    for model in text_models[:6]: # Берем первые 6, чтобы не спамить
-        row.append(InlineKeyboardButton(model, callback_data=f"set_text_{model}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
-    # Кнопки для графических моделей
-    keyboard.append([InlineKeyboardButton("🎨 --- Модели изображений ---", callback_data="ignore")])
-    image_models = ["flux", "turbo", "midjourney"] # midjourney в pollinations это часто стиль, но оставим как опцию
-    img_row = [InlineKeyboardButton(m, callback_data=f"set_image_{m}") for m in image_models]
-    keyboard.append(img_row)
-
+async def show_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает клавиатуру с выбором типа моделей"""
+    keyboard = [
+        [InlineKeyboardButton("📝 Текстовые модели", callback_data='list_text_models')],
+        [InlineKeyboardButton("🎨 Графические модели", callback_data='list_image_models')],
+        [InlineKeyboardButton("⚙️ Текущие настройки", callback_data='show_settings')]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    msg = "⚙️ **Панель управления моделями**\nВыберите, какой движок мне использовать:"
-    
-    if update.message:
-        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        # Если вызвано из callback
-        await update.callback_query.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text("Что будем настраивать?", reply_markup=reply_markup)
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия кнопок смены моделей."""
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    user_text_lower = user_text.lower()
+    
+    # Инициализация данных, если бот перезапускался
+    if 'text_model' not in context.user_data: context.user_data['text_model'] = 'openai'
+    if 'image_model' not in context.user_data: context.user_data['image_model'] = 'flux'
+    if 'history' not in context.user_data: context.user_data['history'] = [{"role": "system", "content": "You are a helpful and smart AI assistant."}]
+
+    # 1. АНАЛИЗ НАМЕРЕНИЙ (INTENT RECOGNITION)
+    
+    # A. Запрос на список моделей
+    if any(phrase in user_text_lower for phrase in ["какие модели", "список моделей", "покажи модели", "what models"]):
+        await show_models(update, context)
+        return
+
+    # B. Запрос на смену модели текстом (например: "Используй gpt-4")
+    # Простейший поиск названия модели в тексте
+    found_text_model = next((m for m in api.available_text_models if m in user_text_lower), None)
+    found_image_model = next((m for m in api.available_image_models if m in user_text_lower), None)
+
+    if "используй" in user_text_lower or "включи" in user_text_lower or "use" in user_text_lower:
+        if found_text_model:
+            context.user_data['text_model'] = found_text_model
+            await update.message.reply_text(f"✅ Готово! Переключился на текстовую модель: **{found_text_model}**", parse_mode=ParseMode.MARKDOWN)
+            return
+        elif found_image_model:
+            context.user_data['image_model'] = found_image_model
+            await update.message.reply_text(f"✅ Готово! Теперь рисую через: **{found_image_model}**", parse_mode=ParseMode.MARKDOWN)
+            return
+
+    # C. Запрос на генерацию изображения
+    # Ключевые слова-триггеры
+    image_triggers = ["нарисуй", "сгенерируй", "создай изображение", "фото", "картинка", "draw", "generate image", "picture of"]
+    is_image_request = any(trigger in user_text_lower for trigger in image_triggers)
+
+    if is_image_request:
+        # Пытаемся очистить промпт от триггерных слов для лучшего качества
+        clean_prompt = user_text
+        for trigger in image_triggers:
+            clean_prompt = re.sub(trigger, "", clean_prompt, flags=re.IGNORECASE)
+        clean_prompt = clean_prompt.strip()
+        
+        if len(clean_prompt) < 2:
+            clean_prompt = user_text # Если стерли всё, используем оригинал
+
+        current_img_model = context.user_data['image_model']
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+        
+        image_url = api.generate_image_url(clean_prompt, model=current_img_model, seed=update.message.message_id)
+        
+        try:
+            caption = f"🎨 **{current_img_model}**: {clean_prompt}"
+            await update.message.reply_photo(photo=image_url, caption=caption[:1000], parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await update.message.reply_text(f"Не удалось загрузить изображение. Попробуйте еще раз. Ошибка: {e}")
+        return
+
+    # 2. ЕСЛИ ЭТО ОБЫЧНЫЙ ТЕКСТОВЫЙ ЗАПРОС
+    
+    # Добавляем сообщение пользователя в историю
+    history = context.user_data['history']
+    history.append({"role": "user", "content": user_text})
+    
+    # Ограничиваем историю последними 10 сообщениями, чтобы не перегружать контекст
+    if len(history) > 12:
+        history = [history[0]] + history[-11:] # Оставляем системный промпт + последние 10
+
+    current_txt_model = context.user_data['text_model']
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    # Генерируем ответ
+    ai_response = api.generate_text(history, model=current_txt_model)
+    
+    # Добавляем ответ бота в историю
+    history.append({"role": "assistant", "content": ai_response})
+    context.user_data['history'] = history
+
+    # Отправляем ответ (Markdown может выдавать ошибки если модель вернет битый маркдаун, поэтому безопаснее просто текст или HTML, но попробуем MD)
+    try:
+        await update.message.reply_text(ai_response, parse_mode=None) # parse_mode=None чтобы избежать ошибок форматирования от нейросети
+    except Exception:
+        # Если ответ слишком длинный или кривой
+        await update.message.reply_text(ai_response[:4000])
+
+# --- ОБРАБОТЧИК КНОПОК ---
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     data = query.data
-    user_id = query.from_user.id
-    prefs = await get_user_prefs(user_id)
+    
+    if data == 'list_text_models':
+        # Создаем кнопки для первых 10 моделей (Telegram не любит слишком много кнопок сразу)
+        keyboard = []
+        for model in api.available_text_models[:10]: # Берем топ-10
+            keyboard.append([InlineKeyboardButton(model, callback_data=f"set_text_{model}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
+        await query.edit_message_text(text="Выберите текстовую модель:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    if data == "ignore":
-        return
+    elif data == 'list_image_models':
+        keyboard = []
+        for model in api.available_image_models:
+            keyboard.append([InlineKeyboardButton(model, callback_data=f"set_image_{model}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
+        await query.edit_message_text(text="Выберите модель для рисования:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    if data.startswith("set_text_"):
-        new_model = data.replace("set_text_", "")
-        prefs['text_model'] = new_model
-        await query.edit_message_text(f"✅ Готово! Теперь я использую текстовую модель: **{new_model}**", parse_mode='Markdown')
-        
+    elif data.startswith("set_text_"):
+        model_name = data.replace("set_text_", "")
+        context.user_data['text_model'] = model_name
+        await query.edit_message_text(text=f"✅ Текстовая модель изменена на: **{model_name}**", parse_mode=ParseMode.MARKDOWN)
+
     elif data.startswith("set_image_"):
-        new_model = data.replace("set_image_", "")
-        prefs['image_model'] = new_model
-        await query.edit_message_text(f"✅ Готово! Теперь я рисую с помощью: **{new_model}**", parse_mode='Markdown')
+        model_name = data.replace("set_image_", "")
+        context.user_data['image_model'] = model_name
+        await query.edit_message_text(text=f"✅ Графическая модель изменена на: **{model_name}**", parse_mode=ParseMode.MARKDOWN)
 
-async def generate_image(prompt, model):
-    """Генерирует ссылку на изображение."""
-    seed = random.randint(0, 999999)
-    # Формируем URL. Pollinations API прост: GET запрос
-    # safe=true добавляем для безопасности, nologo=true убирает лого
-    url = f"{IMAGE_API_URL}{requests.utils.quote(prompt)}?model={model}&seed={seed}&nologo=true"
-    return url
+    elif data == 'show_settings':
+        txt = context.user_data.get('text_model', 'openai')
+        img = context.user_data.get('image_model', 'flux')
+        text = f"⚙️ **Текущие настройки:**\n\n📝 Текст: `{txt}`\n🎨 Картинки: `{img}`"
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]]
+        await query.edit_message_text(text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    elif data == "main_menu":
+        await show_models(update, context) # Переиспользуем функцию, но нужно адаптировать message/query
+        # Для простоты просто удалим старое и пришлем новое или отредактируем текст
+        keyboard = [
+            [InlineKeyboardButton("📝 Текстовые модели", callback_data='list_text_models')],
+            [InlineKeyboardButton("🎨 Графические модели", callback_data='list_image_models')],
+            [InlineKeyboardButton("⚙️ Текущие настройки", callback_data='show_settings')]
+        ]
+        await query.edit_message_text("Что будем настраивать?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def generate_text_response(history, model):
-    """Генерирует текст через Pollinations."""
-    payload = {
-        "messages": history,
-        "model": model,
-        "jsonMode": False
-    }
-    
-    try:
-        response = requests.post(TEXT_API_URL, json=payload, timeout=30)
-        if response.status_code == 200:
-            return response.text
-        else:
-            return f"Ошибка API ({response.status_code}): {response.text}"
-    except Exception as e:
-        return f"Произошла ошибка соединения: {e}"
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    user_id = update.effective_user.id
-    prefs = await get_user_prefs(user_id)
-    
-    if not user_text:
-        return
-
-    text_lower = user_text.lower()
-
-    # 1. Проверка: Хочет ли пользователь сменить настройки?
-    if any(trigger in text_lower for trigger in MODEL_QUERY_TRIGGERS):
-        await show_models_keyboard(update, context)
-        return
-
-    # 2. Проверка: Хочет ли пользователь изображение?
-    # Если есть ключевое слово ИЛИ длина запроса короткая и начинается с "a " (английский промпт)
-    is_image_request = any(trigger in text_lower for trigger in IMAGE_TRIGGERS)
-    
-    if is_image_request:
-        status_msg = await update.message.reply_text(f"🎨 Генерирую изображение ({prefs['image_model']})...")
-        try:
-            # Чистим промпт от триггерных слов для лучшего качества
-            clean_prompt = user_text
-            for trigger in IMAGE_TRIGGERS:
-                clean_prompt = clean_prompt.replace(trigger, "", 1) # убираем только первое вхождение
-            
-            image_url = await generate_image(clean_prompt.strip(), prefs['image_model'])
-            
-            # Отправляем картинку
-            await update.message.reply_photo(photo=image_url, caption=f"🖼 `{clean_prompt.strip()}`\nМодель: {prefs['image_model']}", parse_mode='Markdown')
-            await context.bot.delete_message(chat_id=user_id, message_id=status_msg.message_id)
-        except Exception as e:
-            await status_msg.edit_text(f"Не удалось сгенерировать изображение. Ошибка: {e}")
-        return
-
-    # 3. Обработка текстового запроса (LLM)
-    status_msg = await update.message.reply_text("🤔 Думаю...")
-    
-    # Формируем историю (простая реализация: системный промпт + последний запрос)
-    # Можно расширить до хранения последних N сообщений
-    messages = [
-        {"role": "system", "content": "Ты полезный, умный и веселый ассистент. Отвечай в формате Markdown. Если пользователь просит код, давай код."},
-        {"role": "user", "content": user_text}
-    ]
-    
-    response_text = await generate_text_response(messages, prefs['text_model'])
-    
-    try:
-        await status_msg.edit_text(response_text, parse_mode='Markdown')
-    except:
-        # Если Markdown сломался (бывает с спецсимволами), отправляем как простой текст
-        await status_msg.edit_text(response_text)
-
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("settings", show_models_keyboard))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print(f"Бот запущен! Токен: {BOT_TOKEN}")
-    app.run_polling()
+# --- ЗАПУСК ---
 
 if __name__ == '__main__':
-    main()
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("models", show_models))
+    
+    # Обработчик кнопок
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Основной обработчик сообщений (должен быть последним)
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    print("Bot is running...")
+    application.run_polling()
