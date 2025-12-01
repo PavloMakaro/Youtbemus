@@ -1,230 +1,486 @@
-import logging
-import requests
-import time
-import re
-import json
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
-from telegram.constants import ParseMode, ChatAction
+import logging
+import sqlite3
+import os
+import uuid
+import html
+import importlib.util
+import re
+import urllib.parse
+from datetime import datetime
 
-# --- КОНФИГУРАЦИЯ ---
-TOKEN = "8377691734:AAGywySfCYU8lI9UWQUHW9CHdEKFXkl2fe8"
-
-# Логирование (чтобы видеть ошибки в консоли, а не в чате)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+import aiohttp
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 )
+from aiogram.filters import Command, CommandStart, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+# ==============================================================================
+# 1. КОНФИГУРАЦИЯ
+# ==============================================================================
+BOT_TOKEN = "8597344193:AAG9qMpW_-9g643by4L0209NE6WYRTF4bqI"
+CHANNEL_ID = "@storemoduleTg"
+STORE_DIR = "store"
+DB_NAME = "universli_ultra.db"
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-class PollinationsBrain:
-    def __init__(self):
-        self.text_url = "https://text.pollinations.ai/"
-        self.image_base = "https://pollinations.ai/p/"
-        
-        # 1. ЖЕСТКИЙ СПИСОК БЕСПЛАТНЫХ МОДЕЛЕЙ (Самые надежные)
-        # 'openai' - это авто-роутер на доступную сейчас модель (часто gpt-4o-mini)
-        self.safe_text_models = ["openai", "mistral", "mistral-large", "llama", "qwen", "searchgpt"]
-        self.safe_image_models = ["flux", "flux-realism", "flux-anime", "flux-3d", "turbo"]
-        
-        self.current_text_model = "openai" # Самая стабильная по умолчанию
+# Создаем папку для скриптов
+if not os.path.exists(STORE_DIR):
+    os.makedirs(STORE_DIR)
 
-    def generate_text_safe(self, messages, model_preference=None, seed=None):
-        """
-        Пытается сгенерировать текст. 
-        Если выбранная модель падает с ошибкой 402/404, переключается на запасную.
-        """
-        # Если модель не передана, берем дефолтную 'openai'
-        model_to_use = model_preference if model_preference else "openai"
-        
-        payload = {
-            "messages": messages,
-            "model": model_to_use,
-            "jsonMode": False
-        }
-        if seed: payload["seed"] = seed
+# ==============================================================================
+# 2. МЕНЕДЖЕР БАЗЫ ДАННЫХ (Thread-Safe + Auto-Migration)
+# ==============================================================================
+class DatabaseManager:
+    def __init__(self, db_name):
+        self.db_name = db_name
+        self.lock = asyncio.Lock()
+        self.conn = None
+        self.cursor = None
 
-        try:
-            # Таймаут 60 сек
-            response = requests.post(self.text_url, json=payload, timeout=60)
-            
-            # Если успех
-            if response.status_code == 200:
-                return response.text
-            
-            # Если ошибка доступа (402) или не найдено (404) -> ПРОБУЕМ ЗАПАСНУЮ
-            if response.status_code in [402, 404]:
-                logger.warning(f"Model {model_to_use} failed ({response.status_code}). Switching to backup.")
-                # Фолбэк на 'openai' (самый надежный бесплатный эндпоинт)
-                payload["model"] = "openai"
-                fallback_resp = requests.post(self.text_url, json=payload, timeout=60)
-                if fallback_resp.status_code == 200:
-                    return f"{fallback_resp.text}\n\n_(Примечание: Запрошенная модель недоступна, ответ от базовой модели)_"
-                else:
-                    return f"⚠️ Сервер перегружен (Error {fallback_resp.status_code}). Попробуйте позже."
-            
-            return f"Error: {response.text}"
+    def connect(self):
+        """Подключение и инициализация таблиц."""
+        self.conn = sqlite3.connect(self.db_name, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.create_tables()
+        self.migrate_tables()
 
-        except requests.exceptions.Timeout:
-            return "⚠️ Время ожидания истекло. Попробуйте упростить запрос."
-        except Exception as e:
-            return f"⚠️ Ошибка соединения: {e}"
+    def create_tables(self):
+        """Создание базовой структуры."""
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                active_module_uuid TEXT DEFAULT NULL
+            )
+        """)
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS modules (
+                uuid TEXT PRIMARY KEY,
+                author_id INTEGER,
+                code_path TEXT,
+                name TEXT,
+                description TEXT,
+                is_public INTEGER DEFAULT 1,
+                created_at TEXT
+            )
+        """)
+        self.conn.commit()
 
-    def generate_image_url(self, prompt, model="flux", seed=None):
-        """Генерация ссылки на картинку (без 404, так как это просто ссылка)"""
-        import urllib.parse
-        # Очищаем промпт
-        clean_prompt = re.sub(r'[^\w\s\-\.,]', '', prompt)[:300] # Убираем мусор, обрезаем длину
-        encoded = urllib.parse.quote(clean_prompt)
-        
-        # Случайное число для seed, если не задано, чтобы картинки были разными
-        if not seed:
-            import random
-            seed = random.randint(1, 999999)
-            
-        url = f"{self.image_base}{encoded}?width=1024&height=1024&model={model}&nologo=true&seed={seed}"
-        return url, seed
+    def migrate_tables(self):
+        """Автоматическое добавление колонок для совместимости со старыми версиями БД."""
+        migrations = [
+            "ALTER TABLE modules ADD COLUMN is_public INTEGER DEFAULT 1",
+            "ALTER TABLE modules ADD COLUMN name TEXT DEFAULT 'Модуль'"
+        ]
+        for sql in migrations:
+            try:
+                self.cursor.execute(sql)
+                self.conn.commit()
+                logger.info(f"🔧 DB Migration applied: {sql}")
+            except sqlite3.OperationalError:
+                pass  # Колонка уже существует
 
-brain = PollinationsBrain()
+    async def execute(self, sql: str, params: tuple = ()):
+        """Безопасная запись в БД."""
+        async with self.lock:
+            try:
+                self.cursor.execute(sql, params)
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"DB Error: {e}")
 
-# --- ЛОГИКА БОТА ---
+    async def fetchone(self, sql: str, params: tuple = ()):
+        async with self.lock:
+            self.cursor.execute(sql, params)
+            return self.cursor.fetchone()
 
-SYSTEM_PROMPT = {
-    "role": "system", 
-    "content": "You are a helpful AI assistant using Pollinations API. Be concise."
-}
+    async def fetchall(self, sql: str, params: tuple = ()):
+        async with self.lock:
+            self.cursor.execute(sql, params)
+            return self.cursor.fetchall()
 
-# --- ПРОВЕРКА И СБРОС КОНТЕКСТА ---
-async def check_context(context, chat_id):
-    last_time = context.user_data.get('last_time', 0)
-    if time.time() - last_time > 3600: # 1 час
-        context.user_data['history'] = [SYSTEM_PROMPT]
-        context.user_data['last_time'] = time.time()
-        return True
-    context.user_data['last_time'] = time.time()
-    return False
+# Инициализация БД
+db = DatabaseManager(DB_NAME)
+db.connect()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['history'] = [SYSTEM_PROMPT]
-    context.user_data['txt_model'] = "openai"
-    context.user_data['img_model'] = "flux"
-    context.user_data['last_time'] = time.time()
+# ==============================================================================
+# 3. AI И УТИЛИТЫ
+# ==============================================================================
+
+async def query_pollinations(prompt: str) -> str:
+    """Запрос к AI с правильным кодированием URL."""
+    # Используем quote для безопасности URL
+    safe_prompt = urllib.parse.quote(prompt)
+    # Добавляем seed для вариативности
+    url = f"https://text.pollinations.ai/{safe_prompt}?model=openai&seed={os.urandom(2).hex()}"
     
-    await update.message.reply_text(
-        "👋 **Я починился!**\n\n"
-        "Теперь я автоматически обхожу платные модели.\n"
-        "Пиши что угодно или проси *'нарисуй кота'*.\n"
-        "Если модель будет недоступна, я использую запасную.",
-        parse_mode=ParseMode.MARKDOWN
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.text()
+                return ""
+        except Exception as e:
+            logger.error(f"AI Request Error: {e}")
+            return ""
+
+def clean_python_code(raw_text: str) -> str:
+    """Очищает Markdown разметку."""
+    match = re.search(r"```python(.*?)```", raw_text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return raw_text.strip()
+
+async def deploy_module(user_id: int, code: str, is_public: bool, bot: Bot, status_msg: Message, origin_prompt: str = ""):
+    """Основная логика: Сохранение -> Анализ AI -> БД -> Публикация."""
+    
+    # 1. Валидация
+    if "def run" not in code:
+        await status_msg.edit_text("❌ <b>Ошибка:</b> В коде нет функции `def run(text):`")
+        return
+
+    # 2. Сохранение файла
+    mod_uuid = str(uuid.uuid4())[:8]
+    file_path = os.path.join(STORE_DIR, f"{mod_uuid}.py")
+    
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    await status_msg.edit_text("🧠 <b>AI анализирует код и придумывает название...</b>", parse_mode=ParseMode.HTML)
+
+    # 3. Генерация метаданных (Название, Описание, Теги)
+    # Берем начало кода для контекста
+    code_snippet = code[:1500]
+    
+    analyze_prompt = (
+        f"Analyze this python code provided by user. Context: '{origin_prompt}'. "
+        "Create a short Creative Name (Title) in Russian и напиши какими командами использовать , a Description (max 2 sentences) in Russian, and Hashtags. "
+        "Use '@@@' as separator. Strict Format: NAME@@@DESCRIPTION@@@HASHTAGS. "
+        "Do not write anything else. "
+        f"Code: {code_snippet}"
+    )
+    
+    analysis = await query_pollinations(analyze_prompt)
+    
+    # Значения по умолчанию
+    mod_name = "Пользовательский модуль"
+    mod_desc = "Описание отсутствует"
+    mod_tags = "#python #bot"
+
+    # Парсинг ответа AI
+    try:
+        if "@@@" in analysis:
+            parts = analysis.split("@@@")
+            if len(parts) >= 3:
+                mod_name = parts[0].strip().replace('"', '').replace('*', '')
+                mod_desc = parts[1].strip()
+                mod_tags = parts[2].strip()
+    except Exception as e:
+        logger.error(f"AI Parse Error: {e}")
+
+    # 4. Сохранение в БД
+    await db.execute(
+        "INSERT INTO modules (uuid, author_id, code_path, name, description, is_public, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (mod_uuid, user_id, file_path, mod_name, mod_desc, 1 if is_public else 0, datetime.now().isoformat())
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.effective_chat.id
-
-    # 1. Проверка времени (сброс через час)
-    if await check_context(context, chat_id):
-        await update.message.reply_text("⏳ Начал новый диалог (прошел час).")
-
-    # 2. Ручной сброс
-    if text.lower() in ['сброс', 'reset', '/reset']:
-        context.user_data['history'] = [SYSTEM_PROMPT]
-        await update.message.reply_text("🧹 Память очищена.")
-        return
-
-    # 3. Смена настроек текстом ("используй модель mistral")
-    lower_text = text.lower()
-    if "используй" in lower_text or "use model" in lower_text:
-        # Проверяем безопасные модели
-        for m in brain.safe_text_models:
-            if m in lower_text:
-                context.user_data['txt_model'] = m
-                await update.message.reply_text(f"✅ Окей, пробую использовать модель: **{m}**", parse_mode=ParseMode.MARKDOWN)
-                return
-        for m in brain.safe_image_models:
-            if m in lower_text:
-                context.user_data['img_model'] = m
-                await update.message.reply_text(f"🎨 Для рисования теперь: **{m}**", parse_mode=ParseMode.MARKDOWN)
-                return
-
-    # 4. Рисование
-    draw_triggers = ["нарисуй", "сгенерируй", "фото", "draw", "image"]
-    if any(text.lower().startswith(t) for t in draw_triggers):
-        # Чистим запрос
-        prompt = text
-        for t in draw_triggers:
-            prompt = re.sub(t, "", prompt, flags=re.IGNORECASE)
-        
-        model = context.user_data.get('img_model', 'flux')
-        
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-        
-        # Генерируем URL
-        img_url, seed = brain.generate_image_url(prompt, model=model)
-        
+    # 5. Публикация в канал (если публичный)
+    if is_public:
         try:
-            # Попытка отправить фото (Telegram сам загрузит по ссылке)
-            await update.message.reply_photo(img_url, caption=f"🖼 **{model}** (Seed: {seed})", parse_mode=ParseMode.MARKDOWN)
+            bot_info = await bot.get_me()
+            deep_link = f"https://t.me/{bot_info.username}?start={mod_uuid}"
+            
+            post_text = (
+                f"<b>🆕 {html.escape(mod_name)}</b>\n\n"
+                f"📝 {html.escape(mod_desc)}\n\n"
+                f"🏷 {html.escape(mod_tags)}\n\n"
+                f"🆔 ID: <code>{mod_uuid}</code>"
+            )
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Установить", url=deep_link)]])
+            await bot.send_message(CHANNEL_ID, post_text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception as e:
-            # Если Telegram не смог загрузить (таймаут), отправляем ссылкой
-            await update.message.reply_text(f"⚠️ Не смог загрузить картинку в чат (сервер занят), но вот ссылка:\n{img_url}")
+            logger.error(f"Channel Publish Error: {e}")
+
+    # 6. Авто-установка пользователю
+    await db.execute("UPDATE users SET active_module_uuid = ? WHERE user_id = ?", (mod_uuid, user_id))
+    
+    kb_exit = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Выключить модуль")]],
+        resize_keyboard=True, is_persistent=True
+    )
+    
+    await status_msg.delete()
+    
+    status_icon = "📢 Публичный" if is_public else "🔒 Приватный"
+    
+    await bot.send_message(
+        user_id,
+        f"✅ <b>Модуль установлен!</b>\n"
+        f"⚙️ Статус: {status_icon}\n\n"
+        f"📌 <b>{html.escape(mod_name)}</b>\n"
+        f"<i>{html.escape(mod_desc)}</i>",
+        reply_markup=kb_exit,
+        parse_mode=ParseMode.HTML
+    )
+
+# ==============================================================================
+# 4. РОУТЕРЫ И ЛОГИКА
+# ==============================================================================
+router_high = Router()  # 1. Выход
+router_mid = Router()   # 2. Сессия
+router_low = Router()   # 3. Меню
+
+class CreateModule(StatesGroup):
+    waiting_for_ai_prompt = State()
+    waiting_for_manual_code = State()
+    waiting_for_privacy_choice = State()
+
+# --- ПРИОРИТЕТ 1: ВЫХОД ---
+@router_high.message(F.text == "❌ Выключить модуль")
+async def exit_module(message: Message):
+    """Принудительный выход из активного модуля."""
+    await db.execute("UPDATE users SET active_module_uuid = NULL WHERE user_id = ?", (message.from_user.id,))
+    await message.answer(
+        "<b>🔴 Модуль остановлен.</b>\nВозврат в систему.",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.HTML
+    )
+    await show_kernel_menu(message)
+
+# --- ПРИОРИТЕТ 2: АКТИВНАЯ СЕССИЯ ---
+async def is_session_active(message: Message) -> bool:
+    if not message.from_user: return False
+    res = await db.fetchone("SELECT active_module_uuid FROM users WHERE user_id = ?", (message.from_user.id,))
+    return res is not None and res[0] is not None
+
+@router_mid.message(is_session_active)
+async def module_runtime_handler(message: Message):
+    """Перехват сообщений и отправка в модуль."""
+    user_id = message.from_user.id
+    row = await db.fetchone("SELECT active_module_uuid FROM users WHERE user_id = ?", (user_id,))
+    module_uuid = row[0]
+
+    mod_row = await db.fetchone("SELECT code_path FROM modules WHERE uuid = ?", (module_uuid,))
+    if not mod_row:
+        await message.answer("⚠️ Ошибка: Файл модуля не найден. Сброс сессии.")
+        await db.execute("UPDATE users SET active_module_uuid = NULL WHERE user_id = ?", (user_id,))
         return
 
-    # 5. Текст
-    current_model = context.user_data.get('txt_model', 'openai')
-    history = context.user_data.get('history', [SYSTEM_PROMPT])
-    history.append({"role": "user", "content": text})
-    
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    
-    # ВАЖНО: Вызов безопасной функции генерации
-    response_text = brain.generate_text_safe(history, model_preference=current_model)
-    
-    history.append({"role": "assistant", "content": response_text})
-    if len(history) > 12: history = [history[0]] + history[-11:]
-    context.user_data['history'] = history
-    
-    await update.message.reply_text(response_text)
+    file_path = mod_row[0]
 
+    try:
+        # Динамический импорт
+        spec = importlib.util.spec_from_file_location(f"mod_{module_uuid}", file_path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            
+            # Выполнение run()
+            if hasattr(module, 'run'):
+                user_text = message.text if message.text else ""
+                output = module.run(user_text)
+                await message.answer(html.escape(str(output)), parse_mode=ParseMode.HTML)
+            else:
+                await message.answer("⚠️ В модуле нет функции `run(text)`.")
+    except Exception as e:
+        await message.answer(f"🔥 <b>Ошибка модуля:</b>\n<code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
 
-# --- КНОПКИ (Только рабочие) ---
-async def show_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = []
-    # Текстовые
-    row = []
-    for m in ["openai", "mistral", "searchgpt"]:
-        row.append(InlineKeyboardButton(m, callback_data=f"set_{m}"))
-    keyboard.append(row)
-    
-    # Картинки
-    row = []
-    for m in ["flux", "flux-realism", "flux-anime"]:
-        row.append(InlineKeyboardButton(m, callback_data=f"img_{m}"))
-    keyboard.append(row)
-    
-    await update.message.reply_text("🛠 **Рабочие модели:**", reply_markup=InlineKeyboardMarkup(keyboard))
+# --- ПРИОРИТЕТ 3: ЯДРО (МЕНЮ) ---
 
-async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    
-    if data.startswith("set_"):
-        m = data.split("_")[1]
-        context.user_data['txt_model'] = m
-        await query.edit_message_text(f"Текст: {m}")
-    elif data.startswith("img_"):
-        m = data.split("_")[1]
-        context.user_data['img_model'] = m
-        await query.edit_message_text(f"Картинки: {m}")
+async def show_kernel_menu(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✨ Создать с AI", callback_data="create_ai"),
+            InlineKeyboardButton(text="📥 Загрузить код", callback_data="create_manual")
+        ],
+        [InlineKeyboardButton(text="📂 Мои модули", callback_data="list_modules")]
+    ])
+    await message.answer(
+        "<b>🖥 UNIVERSLI ULTRA OS</b>\n\nЯдро активно. Выберите действие:",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
 
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("models", show_models))
-    app.add_handler(CallbackQueryHandler(btn_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+@router_low.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject):
+    user_id = message.from_user.id
+    await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     
-    print("Bot fixed and running...")
-    app.run_polling()
+    # Проверка Deep Link (установка модуля)
+    if command.args:
+        mod_uuid = command.args
+        mod_row = await db.fetchone("SELECT uuid, name, description FROM modules WHERE uuid = ?", (mod_uuid,))
+        if mod_row:
+            mid, mname, mdesc = mod_row
+            await db.execute("UPDATE users SET active_module_uuid = ? WHERE user_id = ?", (mid, user_id))
+            
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ Выключить модуль")]],
+                resize_keyboard=True, is_persistent=True
+            )
+            await message.answer(
+                f"<b>📥 Загружен модуль: {html.escape(mname)}</b>\n\n{html.escape(mdesc)}",
+                reply_markup=kb, parse_mode=ParseMode.HTML
+            )
+            return
+        else:
+            await message.answer("❌ Модуль не найден.")
+    
+    await show_kernel_menu(message)
+
+# --- FSM: СОЗДАНИЕ ЧЕРЕЗ AI ---
+@router_low.callback_query(F.data == "create_ai")
+async def start_create_ai(call: CallbackQuery, state: FSMContext):
+    await call.message.answer("🤖 <b>Конструктор AI</b>\n\nОпишите, что должен делать бот.", parse_mode=ParseMode.HTML)
+    await state.set_state(CreateModule.waiting_for_ai_prompt)
+    await call.answer()
+
+@router_low.message(CreateModule.waiting_for_ai_prompt)
+async def generate_ai_code(message: Message, state: FSMContext):
+    user_prompt = message.text
+    status_msg = await message.answer("⏳ <b>Генерация кода...</b>")
+    
+    # Промпт для генерации Python
+    system_prompt = (
+        "You are a Python generator. Write a Python script with a function `def run(text):` that returns a string. "
+        "Standard python libs only. Task: " + user_prompt + ". "
+        "Return ONLY raw python code."
+    )
+    
+    raw_code = await query_pollinations(system_prompt)
+    clean_code = clean_python_code(raw_code)
+    
+    await state.update_data(code=clean_code, origin_prompt=user_prompt)
+    await ask_privacy(message, state, status_msg)
+
+# --- FSM: РУЧНАЯ ЗАГРУЗКА ---
+@router_low.callback_query(F.data == "create_manual")
+async def start_create_manual(call: CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        "👨‍💻 <b>Ручная загрузка</b>\n\n"
+        "Пришлите <b>текст кода</b> или <b>файл .py</b>.\n"
+        "Требование: Функция <code>def run(text):</code>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(CreateModule.waiting_for_manual_code)
+    await call.answer()
+
+@router_low.message(CreateModule.waiting_for_manual_code)
+async def receive_manual_code(message: Message, state: FSMContext, bot: Bot):
+    code = ""
+    status_msg = await message.answer("⏳ <b>Чтение данных...</b>")
+
+    if message.document:
+        if not message.document.file_name.endswith('.py'):
+            await status_msg.edit_text("❌ Разрешены только .py файлы")
+            return
+        
+        file_io = await bot.download(message.document)
+        try:
+            code = file_io.read().decode('utf-8')
+        except:
+            await status_msg.edit_text("❌ Ошибка кодировки файла (нужен UTF-8).")
+            return
+
+    elif message.text:
+        code = clean_python_code(message.text)
+    
+    else:
+        await status_msg.edit_text("❌ Пришлите текст или файл.")
+        return
+
+    await state.update_data(code=code, origin_prompt="Manual Upload")
+    await ask_privacy(message, state, status_msg)
+
+# --- FSM: ВЫБОР ПРИВАТНОСТИ ---
+async def ask_privacy(message: Message, state: FSMContext, old_msg: Message):
+    """Спрашиваем пользователя, публиковать ли модуль."""
+    try: await old_msg.delete()
+    except: pass
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Публичный (В канал)", callback_data="privacy_public")],
+        [InlineKeyboardButton(text="🔒 Приватный (Личный)", callback_data="privacy_private")]
+    ])
+    
+    await message.answer("👀 <b>Уровень доступа:</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
+    await state.set_state(CreateModule.waiting_for_privacy_choice)
+
+@router_low.callback_query(CreateModule.waiting_for_privacy_choice)
+async def finish_creation(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    code = data.get("code")
+    origin = data.get("origin_prompt")
+    is_public = (call.data == "privacy_public")
+    
+    try: await call.message.delete()
+    except: pass
+
+    status_msg = await call.message.answer("⏳ <b>Финализация установки...</b>")
+    await deploy_module(call.from_user.id, code, is_public, bot, status_msg, origin_prompt=origin)
+    await state.clear()
+    await call.answer()
+
+# --- СПИСОК МОДУЛЕЙ ---
+@router_low.callback_query(F.data == "list_modules")
+async def list_modules(call: CallbackQuery):
+    user_id = call.from_user.id
+    rows = await db.fetchall("SELECT uuid, name, is_public FROM modules WHERE author_id = ?", (user_id,))
+    
+    if not rows:
+        await call.answer("У вас пока нет модулей.", show_alert=True)
+        return
+
+    text = "<b>📂 Ваши модули:</b>\n"
+    kb_rows = []
+    
+    for r in rows:
+        mid, mname, is_pub = r
+        icon = "📢" if is_pub else "🔒"
+        text += f"\n{icon} <b>{html.escape(mname)}</b>\nID: <code>{mid}</code>"
+        kb_rows.append([InlineKeyboardButton(text=f"🚀 {mname}", url=f"https://t.me/{(await call.bot.get_me()).username}?start={mid}")])
+
+    kb_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode=ParseMode.HTML)
+
+@router_low.callback_query(F.data == "back_to_menu")
+async def back_menu(call: CallbackQuery):
+    await call.message.delete()
+    await show_kernel_menu(call.message)
+
+# ==============================================================================
+# 5. ЗАПУСК
+# ==============================================================================
+async def main():
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Порядок регистрации важен!
+    dp.include_router(router_high)  # 1. Выход
+    dp.include_router(router_mid)   # 2. Сессия
+    dp.include_router(router_low)   # 3. Меню
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    logger.info("🚀 UNIVERSLI ULTRA OS STARTED")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped!")
