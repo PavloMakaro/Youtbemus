@@ -36,6 +36,8 @@ python-telegram-bot==20.7
 yt-dlp==2023.11.16
 ffmpeg-python==0.2.0
 requests==2.31.0
+aiogram 
+aiohttp
 EOF
 
 echo "Обновление списка пакетов..."
